@@ -11,16 +11,21 @@ const {
 
 const {
   joinVoiceChannel,
-  getVoiceConnection
+  getVoiceConnection,
+  entersState,
+  VoiceConnectionStatus
 } = require("@discordjs/voice");
 
 const express = require("express");
 const fs = require("fs");
+const path = require("path");
 
 const app = express();
+const PORT = Number(process.env.PORT) || 3000;
+
 app.get("/", (req, res) => res.send("Guard bot aktif."));
-app.listen(process.env.PORT || 3000, () => {
-  console.log("Web server çalışıyor.");
+app.listen(PORT, () => {
+  console.log(`Web server çalışıyor. Port: ${PORT}`);
 });
 
 const client = new Client({
@@ -36,7 +41,12 @@ const client = new Client({
 
 const PREFIX = process.env.PREFIX || ".";
 const OWNER_ID = process.env.OWNER_ID || "";
-const WHITELIST_FILE = "./whitelist.json";
+const TOKEN = process.env.TOKEN || "";
+const WHITELIST_FILE = path.join(__dirname, "whitelist.json");
+
+if (!TOKEN) {
+  console.error("TOKEN bulunamadı. Render / .env ayarını kontrol et.");
+}
 
 if (!fs.existsSync(WHITELIST_FILE)) {
   fs.writeFileSync(WHITELIST_FILE, JSON.stringify([], null, 2));
@@ -44,7 +54,9 @@ if (!fs.existsSync(WHITELIST_FILE)) {
 
 function loadWhitelist() {
   try {
-    return JSON.parse(fs.readFileSync(WHITELIST_FILE, "utf8"));
+    const raw = fs.readFileSync(WHITELIST_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
   } catch (err) {
     console.error("Whitelist okunamadı:", err);
     return [];
@@ -53,13 +65,14 @@ function loadWhitelist() {
 
 function saveWhitelist(data) {
   try {
-    fs.writeFileSync(WHITELIST_FILE, JSON.stringify(data, null, 2));
+    fs.writeFileSync(WHITELIST_FILE, JSON.stringify([...new Set(data)], null, 2));
   } catch (err) {
     console.error("Whitelist kaydedilemedi:", err);
   }
 }
 
 function isWhitelisted(userId) {
+  if (!userId) return false;
   const whitelist = loadWhitelist();
   return whitelist.includes(userId) || userId === OWNER_ID;
 }
@@ -68,31 +81,61 @@ function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function canIgnoreExecutor(guild, executorId) {
+  if (!executorId || !guild) return true;
+  if (executorId === client.user?.id) return true;
+  if (executorId === guild.ownerId) return true;
+  if (isWhitelisted(executorId)) return true;
+  return false;
+}
+
 async function punishMember(guild, userId, reason) {
   try {
-    if (!guild || !userId) return;
-    if (isWhitelisted(userId)) return;
-    if (userId === guild.ownerId) return;
-    if (userId === client.user.id) return;
+    if (!guild || !userId) return false;
+    if (canIgnoreExecutor(guild, userId)) return false;
+
+    const me = guild.members.me || await guild.members.fetchMe().catch(() => null);
+    if (!me) {
+      console.log("[GUARD] Bot member bilgisi alınamadı.");
+      return false;
+    }
+
+    if (!me.permissions.has(PermissionsBitField.Flags.BanMembers)) {
+      console.log("[GUARD] BanMembers yetkisi yok.");
+      return false;
+    }
 
     const member = await guild.members.fetch(userId).catch(() => null);
-    if (!member) return;
+    if (!member) {
+      console.log(`[GUARD] Üye bulunamadı: ${userId}`);
+      return false;
+    }
 
     if (!member.bannable) {
       console.log(`[GUARD] ${userId} bannable değil. Bot rolü üstte olmayabilir.`);
-      return;
+      return false;
     }
 
     await member.ban({ reason });
     console.log(`[GUARD] ${userId} banlandı. Sebep: ${reason}`);
+    return true;
   } catch (err) {
     console.error("punishMember hata:", err);
+    return false;
   }
 }
 
-async function getRelevantAuditEntry(guild, type, targetId) {
+async function getRelevantAuditEntry(guild, type, targetId, extraDelay = 1800) {
   try {
-    await wait(1800);
+    if (!guild) return null;
+
+    await wait(extraDelay);
+
+    const me = guild.members.me || await guild.members.fetchMe().catch(() => null);
+    if (!me || !me.permissions.has(PermissionsBitField.Flags.ViewAuditLog)) {
+      console.log("[GUARD] ViewAuditLog yetkisi yok.");
+      return null;
+    }
 
     const logs = await guild.fetchAuditLogs({
       type,
@@ -107,7 +150,7 @@ async function getRelevantAuditEntry(guild, type, targetId) {
       const created = e.createdTimestamp || 0;
 
       if (!executorId || !entryTargetId) return false;
-      if (entryTargetId !== targetId) return false;
+      if (targetId && entryTargetId !== targetId) return false;
       if (now - created > 20000) return false;
 
       return true;
@@ -120,8 +163,38 @@ async function getRelevantAuditEntry(guild, type, targetId) {
   }
 }
 
-client.once("ready", () => {
+async function getRecentAuditExecutor(guild, type, extraDelay = 1200) {
+  try {
+    if (!guild) return null;
+
+    await wait(extraDelay);
+
+    const me = guild.members.me || await guild.members.fetchMe().catch(() => null);
+    if (!me || !me.permissions.has(PermissionsBitField.Flags.ViewAuditLog)) {
+      console.log("[GUARD] ViewAuditLog yetkisi yok.");
+      return null;
+    }
+
+    const logs = await guild.fetchAuditLogs({
+      type,
+      limit: 10
+    });
+
+    const entry = logs.entries.find(e => {
+      const created = e.createdTimestamp || 0;
+      return Date.now() - created <= 15000;
+    });
+
+    return entry || null;
+  } catch (err) {
+    console.error("Recent audit alınamadı:", err);
+    return null;
+  }
+}
+
+client.once("ready", async () => {
   console.log(`${client.user.tag} aktif.`);
+
   client.user.setPresence({
     activities: [
       {
@@ -146,7 +219,8 @@ client.on("guildBanAdd", async (ban) => {
     const entry = await getRelevantAuditEntry(
       guild,
       AuditLogEvent.MemberBanAdd,
-      targetId
+      targetId,
+      2200
     );
 
     if (!entry) {
@@ -156,11 +230,7 @@ client.on("guildBanAdd", async (ban) => {
 
     const executor = entry.executor;
     if (!executor) return;
-
-    if (isWhitelisted(executor.id)) {
-      console.log(`[GUARD] ${executor.tag} whitelistte, ban işlemi serbest.`);
-      return;
-    }
+    if (canIgnoreExecutor(guild, executor.id)) return;
 
     await punishMember(
       guild,
@@ -183,15 +253,15 @@ client.on("guildMemberRemove", async (member) => {
     const entry = await getRelevantAuditEntry(
       guild,
       AuditLogEvent.MemberKick,
-      targetId
+      targetId,
+      1800
     );
 
     if (!entry) return;
 
     const executor = entry.executor;
     if (!executor) return;
-
-    if (isWhitelisted(executor.id)) return;
+    if (canIgnoreExecutor(guild, executor.id)) return;
 
     await punishMember(
       guild,
@@ -211,25 +281,17 @@ client.on("channelCreate", async (channel) => {
     const guild = channel.guild;
     if (!guild) return;
 
-    await wait(1200);
-
-    const logs = await guild.fetchAuditLogs({
-      type: AuditLogEvent.ChannelCreate,
-      limit: 10
-    });
-
-    const entry = logs.entries.find(e => {
-      const created = e.createdTimestamp || 0;
-      return Date.now() - created <= 15000;
-    });
-
+    const entry = await getRecentAuditExecutor(guild, AuditLogEvent.ChannelCreate, 1400);
     if (!entry || !entry.executor) return;
 
     const executor = entry.executor;
-    if (isWhitelisted(executor.id)) return;
+    if (canIgnoreExecutor(guild, executor.id)) return;
 
     await punishMember(guild, executor.id, "Guard: İzinsiz kanal oluşturma");
-    await channel.delete().catch(() => {});
+
+    if (channel.deletable) {
+      await channel.delete("Guard: İzinsiz oluşturulan kanal silindi").catch(() => {});
+    }
 
     console.log(`[GUARD] ${executor.tag} izinsiz kanal oluşturdu.`);
   } catch (err) {
@@ -243,22 +305,11 @@ client.on("channelDelete", async (channel) => {
     const guild = channel.guild;
     if (!guild) return;
 
-    await wait(1200);
-
-    const logs = await guild.fetchAuditLogs({
-      type: AuditLogEvent.ChannelDelete,
-      limit: 10
-    });
-
-    const entry = logs.entries.find(e => {
-      const created = e.createdTimestamp || 0;
-      return Date.now() - created <= 15000;
-    });
-
+    const entry = await getRecentAuditExecutor(guild, AuditLogEvent.ChannelDelete, 1400);
     if (!entry || !entry.executor) return;
 
     const executor = entry.executor;
-    if (isWhitelisted(executor.id)) return;
+    if (canIgnoreExecutor(guild, executor.id)) return;
 
     await punishMember(guild, executor.id, "Guard: İzinsiz kanal silme");
 
@@ -274,22 +325,11 @@ client.on("channelUpdate", async (oldChannel, newChannel) => {
     const guild = newChannel.guild;
     if (!guild) return;
 
-    await wait(1200);
-
-    const logs = await guild.fetchAuditLogs({
-      type: AuditLogEvent.ChannelUpdate,
-      limit: 10
-    });
-
-    const entry = logs.entries.find(e => {
-      const created = e.createdTimestamp || 0;
-      return Date.now() - created <= 15000;
-    });
-
+    const entry = await getRecentAuditExecutor(guild, AuditLogEvent.ChannelUpdate, 1400);
     if (!entry || !entry.executor) return;
 
     const executor = entry.executor;
-    if (isWhitelisted(executor.id)) return;
+    if (canIgnoreExecutor(guild, executor.id)) return;
 
     await punishMember(guild, executor.id, "Guard: İzinsiz kanal düzenleme");
 
@@ -312,21 +352,22 @@ client.on("messageCreate", async (message) => {
     const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
     const command = args.shift()?.toLowerCase();
 
-    if (
-      ["wl-ekle", "wl-sil", "wl-liste", "ban", "kick", "join", "leave"].includes(command) &&
-      !isWhitelisted(message.author.id)
-    ) {
+    const restrictedCommands = ["wl-ekle", "wl-sil", "wl-liste", "ban", "kick", "join", "leave"];
+
+    if (restrictedCommands.includes(command) && !isWhitelisted(message.author.id)) {
       return message.reply("Bu komutu kullanmak için whitelistte olman gerekiyor.");
     }
 
-    // .wl-ekle
     if (command === "wl-ekle") {
+      const input = args[0];
+      if (!input) return message.reply("Bir kullanıcı etiketle ya da ID yaz.");
+
       const user =
         message.mentions.users.first() ||
-        await client.users.fetch(args[0]).catch(() => null);
+        await client.users.fetch(input).catch(() => null);
 
       if (!user) {
-        return message.reply("Bir kullanıcı etiketle ya da ID yaz.");
+        return message.reply("Geçerli bir kullanıcı etiketle ya da ID yaz.");
       }
 
       const whitelist = loadWhitelist();
@@ -340,14 +381,16 @@ client.on("messageCreate", async (message) => {
       return message.reply(`${user.tag} whitelist'e eklendi.`);
     }
 
-    // .wl-sil
     if (command === "wl-sil") {
+      const input = args[0];
+      if (!input) return message.reply("Bir kullanıcı etiketle ya da ID yaz.");
+
       const user =
         message.mentions.users.first() ||
-        await client.users.fetch(args[0]).catch(() => null);
+        await client.users.fetch(input).catch(() => null);
 
       if (!user) {
-        return message.reply("Bir kullanıcı etiketle ya da ID yaz.");
+        return message.reply("Geçerli bir kullanıcı etiketle ya da ID yaz.");
       }
 
       let whitelist = loadWhitelist();
@@ -361,29 +404,36 @@ client.on("messageCreate", async (message) => {
       return message.reply(`${user.tag} whitelist'ten çıkarıldı.`);
     }
 
-    // .wl-liste
     if (command === "wl-liste") {
       const whitelist = loadWhitelist();
       if (whitelist.length === 0) {
         return message.reply("Whitelist boş.");
       }
 
-      const text = whitelist.map((id, i) => `${i + 1}. <@${id}> (\`${id}\`)`).join("\n");
+      const text = whitelist
+        .map((id, i) => `${i + 1}. <@${id}> (\`${id}\`)`)
+        .join("\n");
+
       return message.reply(`**Whitelist:**\n${text}`);
     }
 
-    // .ban
     if (command === "ban") {
-      if (!message.guild.members.me.permissions.has(PermissionsBitField.Flags.BanMembers)) {
+      const me = message.guild.members.me || await message.guild.members.fetchMe().catch(() => null);
+      if (!me || !me.permissions.has(PermissionsBitField.Flags.BanMembers)) {
         return message.reply("Ban yetkim yok.");
+      }
+
+      const input = args[0];
+      if (!input) {
+        return message.reply("Banlanacak kullanıcıyı etiketle ya da ID yaz.");
       }
 
       const target =
         message.mentions.members.first() ||
-        await message.guild.members.fetch(args[0]).catch(() => null);
+        await message.guild.members.fetch(input).catch(() => null);
 
       if (!target) {
-        return message.reply("Banlanacak kullanıcıyı etiketle ya da ID yaz.");
+        return message.reply("Geçerli bir kullanıcı etiketle ya da ID yaz.");
       }
 
       if (target.id === message.author.id) {
@@ -392,6 +442,10 @@ client.on("messageCreate", async (message) => {
 
       if (target.id === client.user.id) {
         return message.reply("Beni banlayamazsın.");
+      }
+
+      if (target.id === message.guild.ownerId) {
+        return message.reply("Sunucu sahibini banlayamazsın.");
       }
 
       const reason = args.slice(1).join(" ") || "Sebep belirtilmedi";
@@ -404,18 +458,23 @@ client.on("messageCreate", async (message) => {
       return message.reply(`${target.user.tag} banlandı. Sebep: ${reason}`);
     }
 
-    // .kick
     if (command === "kick") {
-      if (!message.guild.members.me.permissions.has(PermissionsBitField.Flags.KickMembers)) {
+      const me = message.guild.members.me || await message.guild.members.fetchMe().catch(() => null);
+      if (!me || !me.permissions.has(PermissionsBitField.Flags.KickMembers)) {
         return message.reply("Kick yetkim yok.");
+      }
+
+      const input = args[0];
+      if (!input) {
+        return message.reply("Atılacak kullanıcıyı etiketle ya da ID yaz.");
       }
 
       const target =
         message.mentions.members.first() ||
-        await message.guild.members.fetch(args[0]).catch(() => null);
+        await message.guild.members.fetch(input).catch(() => null);
 
       if (!target) {
-        return message.reply("Atılacak kullanıcıyı etiketle ya da ID yaz.");
+        return message.reply("Geçerli bir kullanıcı etiketle ya da ID yaz.");
       }
 
       if (target.id === message.author.id) {
@@ -424,6 +483,10 @@ client.on("messageCreate", async (message) => {
 
       if (target.id === client.user.id) {
         return message.reply("Beni kickleyemezsin.");
+      }
+
+      if (target.id === message.guild.ownerId) {
+        return message.reply("Sunucu sahibini kickleyemezsin.");
       }
 
       const reason = args.slice(1).join(" ") || "Sebep belirtilmedi";
@@ -436,9 +499,8 @@ client.on("messageCreate", async (message) => {
       return message.reply(`${target.user.tag} sunucudan atıldı. Sebep: ${reason}`);
     }
 
-    // .join
     if (command === "join") {
-      const voiceChannel = message.member.voice.channel;
+      const voiceChannel = message.member?.voice?.channel;
 
       if (!voiceChannel) {
         return message.reply("Önce bir ses kanalına girmen lazım.");
@@ -451,26 +513,35 @@ client.on("messageCreate", async (message) => {
         return message.reply("Geçerli bir ses kanalında değilsin.");
       }
 
-      const permissions = voiceChannel.permissionsFor(message.guild.members.me);
+      const me = message.guild.members.me || await message.guild.members.fetchMe().catch(() => null);
+      if (!me) return message.reply("Bot bilgime erişemedim.");
+
+      const permissions = voiceChannel.permissionsFor(me);
 
       if (
-        !permissions.has(PermissionsBitField.Flags.Connect) ||
-        !permissions.has(PermissionsBitField.Flags.ViewChannel)
+        !permissions?.has(PermissionsBitField.Flags.Connect) ||
+        !permissions?.has(PermissionsBitField.Flags.ViewChannel)
       ) {
         return message.reply("Bu ses kanalına girme yetkim yok.");
       }
 
-      joinVoiceChannel({
+      const existing = getVoiceConnection(message.guild.id);
+      if (existing) {
+        existing.destroy();
+      }
+
+      const connection = joinVoiceChannel({
         channelId: voiceChannel.id,
         guildId: voiceChannel.guild.id,
         adapterCreator: voiceChannel.guild.voiceAdapterCreator,
         selfDeaf: true
       });
 
+      await entersState(connection, VoiceConnectionStatus.Ready, 15000).catch(() => null);
+
       return message.reply(`Ses kanalına girdim: **${voiceChannel.name}**`);
     }
 
-    // .leave
     if (command === "leave") {
       const connection = getVoiceConnection(message.guild.id);
 
@@ -503,4 +574,6 @@ process.on("uncaughtExceptionMonitor", err => {
   console.error("Uncaught Exception Monitor:", err);
 });
 
-client.login(process.env.TOKEN);
+client.login(TOKEN).catch(err => {
+  console.error("Bot giriş hatası:", err);
+});
